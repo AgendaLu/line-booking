@@ -6,7 +6,7 @@ const CONFIG = {
   SUMMARY_SHEET_ID: 'YOUR_SUMMARY_SHEET_ID',
   RAW_SHEET_NAME: 'Messages',
   SUMMARY_SHEET_NAME: 'Bookings',
-  MAX_SEATS: 30,
+  MAX_SEATS: 10,
   CLEAR_TIME: 1,
   VALID_INCREMENTS: new Set([
     '+1', '+2', '+3', '+4', 
@@ -61,46 +61,64 @@ function isValidBookingMessage(message) {
 
 function handleBooking(event) {
   try {
+    const currentTotal = getCurrentBookingTotal();
+    const userCurrentBookings = getCurrentUserBookings(event.source.userId);
+    const increment = parseIncrement(event.message.text);
+    
+    // Prepare booking info with initial increment
     const bookingInfo = {
       timestamp: new Date(event.timestamp),
       groupId: event.source.groupId || 'N/A',
       userId: event.source.userId || 'N/A',
       userName: getUserName(event.source.userId),
-      increment: parseIncrement(event.message.text),
+      increment: increment,
       messageId: event.message.id
     };
-    
+
     // Check if message is already logged
     if (isMessageAlreadyLogged(bookingInfo.messageId)) {
       Logger.log('Duplicate message detected, skipping: ' + bookingInfo.messageId);
       return;
     }
 
-    // Get current bookings before changes
-    const currentTotal = getCurrentBookingTotal();
-    const userCurrentBookings = getCurrentUserBookings(bookingInfo.userId);
-    
     // Handle cancellations
-    if (bookingInfo.increment < 0) {
-      const cancelAmount = Math.abs(bookingInfo.increment);
+    if (increment < 0) {
+      const cancelAmount = Math.abs(increment);
       if (cancelAmount > userCurrentBookings) {
+        bookingInfo.increment = 0; // Mark as invalid cancellation
+        logRawMessage(bookingInfo);
         replyMessage(event.replyToken, `無法取消預約。您目前只預訂了 ${userCurrentBookings} 位。`);
         return;
       }
     } 
     // Handle new bookings
-    else if (currentTotal + bookingInfo.increment > CONFIG.MAX_SEATS) {
-      replyMessage(event.replyToken, `抱歉，目前剩餘座位不足。現有預訂人數: ${currentTotal}，最大座位數: ${CONFIG.MAX_SEATS}`);
-      return;
+    else {
+      // Check total seats limit
+      if (currentTotal + increment > CONFIG.MAX_SEATS) {
+        bookingInfo.increment = 0; // Mark as invalid booking
+        logRawMessage(bookingInfo);
+        replyMessage(event.replyToken, `抱歉，目前剩餘座位不足。現有預訂人數: ${currentTotal}，最大座位數: ${CONFIG.MAX_SEATS}`);
+        return;
+      }
+      
+      // Check per-user seats limit
+      const userNewTotal = userCurrentBookings + increment;
+      if (userNewTotal > CONFIG.MAX_SEATS_PER_USER) {
+        bookingInfo.increment = 0; // Mark as exceeding user limit
+        logRawMessage(bookingInfo);
+        replyMessage(event.replyToken, 
+          `您已報名 ${userCurrentBookings} 位，每人報名限制${CONFIG.MAX_SEATS_PER_USER} 位。`);
+        return;
+      }
     }
     
-    // Log raw message and recalculate summary
+    // If we get here, the booking is valid
     logRawMessage(bookingInfo);
     recalculateBookingSummary();
     
     // Get new total after recalculation
     const newTotal = getCurrentBookingTotal();
-    replyMessage(event.replyToken, `已記錄預訂 ${bookingInfo.increment} 位。目前總計: ${newTotal} 位`);
+    replyMessage(event.replyToken, `已記錄${increment > 0 ? '預訂' : '取消'} ${Math.abs(increment)} 位。目前總計: ${newTotal} 位`);
   } catch (error) {
     logError('Error handling booking: ' + error.toString());
   }
@@ -178,6 +196,15 @@ function isMessageAlreadyLogged(messageId) {
   
   // Check if messageId exists in the column
   return messageIdColumn.flat().includes(messageId);
+}
+
+function getCurrentUserBookings(userId) {
+  const sheet = SpreadsheetApp.openById(CONFIG.SUMMARY_SHEET_ID).getSheetByName(CONFIG.SUMMARY_SHEET_NAME);
+  const data = sheet.getDataRange().getValues();
+  
+  // Find user's row (userId is in column 2, index 2)
+  const userRow = data.find(row => row[2] === userId);
+  return userRow ? (parseInt(userRow[4]) || 0) : 0;
 }
 
 function recalculateBookingSummary() {
